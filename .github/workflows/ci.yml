@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build firmware and run tests (if present)
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Build and test
+      uses: espressif/esp-idf-ci-action@v1
+      with:
+        esp_idf_version: v5.4.1
+        target: esp32c6
+        path: .
+        command: |
+          set -e
+          rm -f sdkconfig
+          export SDKCONFIG_DEFAULTS=sdkconfig.defaults
+          idf.py set-target esp32c6
+          idf.py reconfigure
+          idf.py build
+
+          if ! command -v ctest >/dev/null 2>&1; then
+            echo "ctest not available in this environment; skipping tests."
+            exit 0
+          fi
+
+          ctest --test-dir build -N | tee /tmp/ctest-discovery.txt
+          if grep -q "Total Tests: 0" /tmp/ctest-discovery.txt; then
+            echo "No CTest tests registered; skipping test execution."
+          else
+            ctest --test-dir build --output-on-failure
+          fi
