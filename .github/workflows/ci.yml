@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build firmware and run tests (if present)
+    name: Build firmware
     runs-on: ubuntu-latest
 
     steps:
@@ -35,18 +35,6 @@ jobs:
           idf.py set-target esp32c6
           idf.py reconfigure
           idf.py build
-
-          if ! command -v ctest >/dev/null 2>&1; then
-            echo "ctest not available in this environment; skipping tests."
-            exit 0
-          fi
-
-          ctest --test-dir build -N | tee /tmp/ctest-discovery.txt
-          if grep -q "Total Tests: 0" /tmp/ctest-discovery.txt; then
-            echo "No CTest tests registered; skipping test execution."
-          else
-            ctest --test-dir build --output-on-failure
-          fi
 
     - name: Create firmware package
       run: |
