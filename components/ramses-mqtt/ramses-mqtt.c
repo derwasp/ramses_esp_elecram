@@ -124,7 +124,7 @@ static bool mqtt_broker_configured(struct mqtt_data* ctxt)
     if (user)
         ESP_LOGI(TAG, "user=<%s>", user);
     if (password)
-        ESP_LOGI(TAG, "password=<%s>", password);
+        ESP_LOGI(TAG, "password=<set>");
 
     res = uri && uri[0] != '\0';
     if (res) { // Have URI, are we trying to authenticate
