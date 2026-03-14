@@ -82,7 +82,7 @@ CONFIG_OTA_LOG_LEVEL=2
 CONFIG_OTA_URL_SERVER="https://github.com/IMMRMKW/ramses_esp/releases"
 CONFIG_OTA_FILENAME="ramses_esp_c6.bin"
 CONFIG_OTA_VERSION="latest"
-CONFIG_WIFI_MAXIMUM_RETRY=15
+CONFIG_WIFI_MAXIMUM_RETRY=5
 
 # Gateway Configuration
 CONFIG_GWAY_LOG_LEVEL=2
@@ -101,3 +101,4 @@ CONFIG_ZB_DEBUG_MODE=n
 
 # Watchdog: reboot on task hang in production
 CONFIG_ESP_TASK_WDT_PANIC=y
+
