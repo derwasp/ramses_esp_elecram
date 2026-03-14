@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build firmware and run tests (if present)
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Build (fresh sdkconfig from defaults)
+      uses: espressif/esp-idf-ci-action@v1
+      with:
+        esp_idf_version: v5.4.1
+        target: esp32c6
+        path: .
+        command: |
+          set -e
+          rm -f sdkconfig
+          export SDKCONFIG_DEFAULTS=sdkconfig.defaults
+          idf.py set-target esp32c6
+          idf.py reconfigure
+          idf.py build
+
+          if ! command -v ctest >/dev/null 2>&1; then
+            echo "ctest not available in this environment; skipping tests."
+            exit 0
+          fi
+
+          ctest --test-dir build -N | tee /tmp/ctest-discovery.txt
+          if grep -q "Total Tests: 0" /tmp/ctest-discovery.txt; then
+            echo "No CTest tests registered; skipping test execution."
+          else
+            ctest --test-dir build --output-on-failure
+          fi
+
+    - name: Create firmware package
+      run: |
+        set -e
+        mkdir -p release
+        # Keep flash_args for merge step parity with release workflow.
+        cp build/flash_args release/ 2>/dev/null || true
+
+    - name: Build single flash image
+      run: |
+        set -e
+        if [ ! -f build/flash_args ]; then
+          echo "flash_args not found; cannot create merged image" >&2
+          exit 1
+        fi
+        pip install --no-cache-dir esptool
+        mkdir -p release
+        (
+          cd build
+          python -m esptool --chip esp32c6 merge-bin -o ../release/ramses_esp_esp32_c6.bin $(tr '\n' ' ' < flash_args)
+        )
+        (sha256sum release/ramses_esp_esp32_c6.bin || shasum -a 256 release/ramses_esp_esp32_c6.bin) > release/ramses_esp_esp32_c6.bin.sha256 || true
+        ls -lh release/ramses_esp_esp32_c6.bin
