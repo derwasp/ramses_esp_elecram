@@ -47,7 +47,7 @@ menu "Network Configuration"
 
     config WIFI_MAXIMUM_RETRY
         int "Maximum retry"
-        default 5
+        default 15
         help
             Set the Maximum retry to avoid station reconnecting to the AP unlimited when the AP is really inexistent.
 
