@@ -31,12 +31,14 @@ static const char* TAG = "WIFI";
 #define WIFI_LINK_HEALTH_CHECK_MS 5000
 #define WIFI_LINK_HEALTH_MAX_FAILS 3
 #define WIFI_MANAGER_TICK_MS 250
+#define WIFI_CONFIG_ERROR_STREAK_LIMIT 3
 
 #define WIFI_REASON_CONNECT_TIMEOUT (-1)
 #define WIFI_REASON_LINK_HEALTH (-2)
 #define WIFI_REASON_LOST_IP (-3)
 #define WIFI_REASON_API_ERROR (-4)
 #define WIFI_REASON_MANUAL_RESTART (-5)
+#define WIFI_REASON_EVENT_OVERFLOW (-6)
 
 #define WIFI_CONNECTED_BIT BIT0
 
@@ -148,8 +150,10 @@ struct wifi_data {
     TickType_t retry_after_tick;
     TickType_t link_health_check_tick;
     uint8_t link_health_failures;
-    uint8_t suppress_disconnects;
-    uint8_t suppress_lost_ip_events;
+    bool suppress_disconnect_once;
+    bool suppress_lost_ip_once;
+    bool event_overflow;
+    uint8_t config_error_streak;
     int last_reason;
     esp_netif_ip_info_t ip_info;
     bool has_ip;
@@ -234,8 +238,56 @@ static char const* wifi_reason_text(int reason)
         return "api-error";
     case WIFI_REASON_MANUAL_RESTART:
         return "manual-restart";
+    case WIFI_REASON_EVENT_OVERFLOW:
+        return "event-overflow";
     default:
         return "disconnect";
+    }
+}
+
+static bool wifi_reason_is_config_error(int reason)
+{
+    switch (reason) {
+#ifdef WIFI_REASON_AUTH_EXPIRE
+    case WIFI_REASON_AUTH_EXPIRE:
+#endif
+#ifdef WIFI_REASON_AUTH_FAIL
+    case WIFI_REASON_AUTH_FAIL:
+#endif
+#ifdef WIFI_REASON_NOT_AUTHED
+    case WIFI_REASON_NOT_AUTHED:
+#endif
+#ifdef WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+#endif
+#ifdef WIFI_REASON_HANDSHAKE_TIMEOUT
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+#endif
+#ifdef WIFI_REASON_802_1X_AUTH_FAILED
+    case WIFI_REASON_802_1X_AUTH_FAILED:
+#endif
+#ifdef WIFI_REASON_AKMP_INVALID
+    case WIFI_REASON_AKMP_INVALID:
+#endif
+#ifdef WIFI_REASON_UNSUPP_RSN_IE_VERSION
+    case WIFI_REASON_UNSUPP_RSN_IE_VERSION:
+#endif
+#ifdef WIFI_REASON_INVALID_RSN_IE_CAP
+    case WIFI_REASON_INVALID_RSN_IE_CAP:
+#endif
+#ifdef WIFI_REASON_IE_IN_4WAY_DIFFERS
+    case WIFI_REASON_IE_IN_4WAY_DIFFERS:
+#endif
+#ifdef WIFI_REASON_GROUP_CIPHER_INVALID
+    case WIFI_REASON_GROUP_CIPHER_INVALID:
+#endif
+#ifdef WIFI_REASON_PAIRWISE_CIPHER_INVALID
+    case WIFI_REASON_PAIRWISE_CIPHER_INVALID:
+#endif
+        return true;
+
+    default:
+        return false;
     }
 }
 
@@ -268,8 +320,10 @@ static void wifi_msg_post_event(struct wifi_data* ctxt, struct wifi_msg* msg)
     if (!ctxt || !ctxt->queue || !msg)
         return;
 
-    if (xQueueSend(ctxt->queue, msg, 0) != pdTRUE)
+    if (xQueueSend(ctxt->queue, msg, pdMS_TO_TICKS(10)) != pdTRUE) {
+        ctxt->event_overflow = true;
         ESP_LOGW(TAG, "dropping event %d", msg->type);
+    }
 }
 
 bool wifi_is_connected(void)
@@ -417,10 +471,8 @@ static void wifi_reset_driver_generation(struct wifi_data* ctxt, bool restart_dr
         return;
 
     ctxt->generation++;
-    if (ctxt->suppress_disconnects < UINT8_MAX)
-        ctxt->suppress_disconnects++;
-    if (ctxt->suppress_lost_ip_events < UINT8_MAX)
-        ctxt->suppress_lost_ip_events++;
+    ctxt->suppress_disconnect_once = true;
+    ctxt->suppress_lost_ip_once = true;
 
     if (!ctxt->driver_started)
         return;
@@ -438,6 +490,10 @@ static void wifi_begin_connect(struct wifi_data* ctxt)
     char ssid[SSID_LEN];
     TickType_t now = xTaskGetTickCount();
     esp_err_t err;
+
+    /* Clear stale suppression flags from previous managed transitions. */
+    ctxt->suppress_disconnect_once = false;
+    ctxt->suppress_lost_ip_once = false;
 
     if (!wifi_has_config(ctxt)) {
         wifi_clear_link_state(ctxt);
@@ -501,12 +557,30 @@ static void wifi_schedule_retry(struct wifi_data* ctxt, int reason, char const* 
 {
     TickType_t now = xTaskGetTickCount();
     bool restart_driver = false;
+    bool config_error;
 
     if (!ctxt)
         return;
 
     ctxt->last_reason = reason;
     wifi_clear_link_state(ctxt);
+    config_error = wifi_reason_is_config_error(reason);
+    if (config_error) {
+        if (ctxt->config_error_streak < UINT8_MAX)
+            ctxt->config_error_streak++;
+    } else {
+        ctxt->config_error_streak = 0;
+    }
+
+    if (config_error && ctxt->config_error_streak >= WIFI_CONFIG_ERROR_STREAK_LIMIT) {
+        ESP_LOGE(TAG,
+            "WiFi auth/config failure streak %u (%s/%d), stopping until manual restart or credential update",
+            (unsigned int)ctxt->config_error_streak, wifi_reason_text(reason), reason);
+        wifi_reset_driver_generation(ctxt, true);
+        ctxt->retry_num = 0;
+        wifi_set_state(ctxt, WIFI_STOPPED);
+        return;
+    }
 
     ctxt->retry_num++;
     if (ctxt->retry_num >= CONFIG_WIFI_MAXIMUM_RETRY) {
@@ -536,6 +610,7 @@ static void wifi_request_restart(struct wifi_data* ctxt)
     TickType_t now = xTaskGetTickCount();
 
     ctxt->retry_num = 0;
+    ctxt->config_error_streak = 0;
     ctxt->last_reason = WIFI_REASON_MANUAL_RESTART;
     wifi_clear_link_state(ctxt);
     wifi_reset_driver_generation(ctxt, true);
@@ -590,8 +665,11 @@ static void wifi_print_status(struct wifi_data* ctxt)
     printf("# WiFi connected: %s\n", wifi_is_connected() ? "yes" : "no");
     printf("# WiFi driver started: %s\n", ctxt->driver_started ? "yes" : "no");
     printf("# WiFi retries: %u/%d\n", (unsigned int)ctxt->retry_num, CONFIG_WIFI_MAXIMUM_RETRY);
+    printf("# WiFi config error streak: %u/%u\n",
+        (unsigned int)ctxt->config_error_streak, WIFI_CONFIG_ERROR_STREAK_LIMIT);
     printf("# WiFi last reason: %s (%d)\n", wifi_reason_text(ctxt->last_reason), ctxt->last_reason);
     printf("# WiFi generation: %u\n", (unsigned int)ctxt->generation);
+    printf("# WiFi event overflow pending: %s\n", ctxt->event_overflow ? "yes" : "no");
     if (ctxt->has_ip) {
         printf("# WiFi IP: " IPSTR "\n", IP2STR(&ctxt->ip_info.ip));
     } else {
@@ -633,9 +711,12 @@ static void wifi_handle_got_ip(struct wifi_data* ctxt, struct wifi_msg const* ms
     ctxt->ip_info = msg->param.got_ip.ip_info;
     ctxt->has_ip = true;
     ctxt->retry_num = 0;
+    ctxt->config_error_streak = 0;
     ctxt->link_health_failures = 0;
     ctxt->connect_deadline = 0;
     ctxt->link_health_check_tick = xTaskGetTickCount() + pdMS_TO_TICKS(WIFI_LINK_HEALTH_CHECK_MS);
+    ctxt->suppress_disconnect_once = false;
+    ctxt->suppress_lost_ip_once = false;
 
     if (ctxt->event_group)
         xEventGroupSetBits(ctxt->event_group, WIFI_CONNECTED_BIT);
@@ -654,8 +735,8 @@ static void wifi_handle_disconnected(struct wifi_data* ctxt, struct wifi_msg con
     if (!ctxt || !msg || msg->generation != ctxt->generation)
         return;
 
-    if (ctxt->suppress_disconnects > 0) {
-        ctxt->suppress_disconnects--;
+    if (ctxt->suppress_disconnect_once) {
+        ctxt->suppress_disconnect_once = false;
         ESP_LOGI(TAG, "ignoring managed disconnect (reason=%d)", msg->param.disconnected.reason);
         return;
     }
@@ -675,8 +756,8 @@ static void wifi_handle_lost_ip(struct wifi_data* ctxt, struct wifi_msg const* m
     if (!ctxt || !msg || msg->generation != ctxt->generation)
         return;
 
-    if (ctxt->suppress_lost_ip_events > 0) {
-        ctxt->suppress_lost_ip_events--;
+    if (ctxt->suppress_lost_ip_once) {
+        ctxt->suppress_lost_ip_once = false;
         ESP_LOGI(TAG, "ignoring managed lost-ip event");
         return;
     }
@@ -738,6 +819,13 @@ static void wifi_poll(struct wifi_data* ctxt)
     if (!ctxt)
         return;
 
+    if (ctxt->event_overflow && ctxt->state != WIFI_IDLE && ctxt->state != WIFI_STOPPED) {
+        ctxt->event_overflow = false;
+        ESP_LOGW(TAG, "event queue overflow detected, forcing reconnect cycle");
+        wifi_schedule_retry(ctxt, WIFI_REASON_EVENT_OVERFLOW, "event-queue-overflow", true);
+        return;
+    }
+
     switch (ctxt->state) {
     case WIFI_IDLE:
     case WIFI_STOPPED:
@@ -774,7 +862,7 @@ static void Wifi(void* param)
 
     ESP_LOGI(TAG, "Task Started");
 
-    ctxt->queue = xQueueCreate(16, sizeof(struct wifi_msg));
+    ctxt->queue = xQueueCreate(24, sizeof(struct wifi_msg));
 
     wifi_check_station(ctxt);
     wifi_create(ctxt);
@@ -790,8 +878,11 @@ static void Wifi(void* param)
     for (;;) {
         struct wifi_msg msg;
 
-        if (xQueueReceive(ctxt->queue, &msg, pdMS_TO_TICKS(WIFI_MANAGER_TICK_MS)) == pdTRUE)
+        if (xQueueReceive(ctxt->queue, &msg, pdMS_TO_TICKS(WIFI_MANAGER_TICK_MS)) == pdTRUE) {
             wifi_handle_message(ctxt, &msg);
+            while (xQueueReceive(ctxt->queue, &msg, 0) == pdTRUE)
+                wifi_handle_message(ctxt, &msg);
+        }
 
         wifi_poll(ctxt);
 #if CONFIG_IDF_TARGET_ESP32C6
