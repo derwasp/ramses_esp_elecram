@@ -22,7 +22,7 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Build and test
+    - name: Build (fresh sdkconfig from defaults)
       uses: espressif/esp-idf-ci-action@v1
       with:
         esp_idf_version: v5.4.1
@@ -47,3 +47,26 @@ jobs:
           else
             ctest --test-dir build --output-on-failure
           fi
+
+    - name: Create firmware package
+      run: |
+        set -e
+        mkdir -p release
+        # Keep flash_args for merge step parity with release workflow.
+        cp build/flash_args release/ 2>/dev/null || true
+
+    - name: Build single flash image
+      run: |
+        set -e
+        if [ ! -f build/flash_args ]; then
+          echo "flash_args not found; cannot create merged image" >&2
+          exit 1
+        fi
+        pip install --no-cache-dir esptool
+        mkdir -p release
+        (
+          cd build
+          python -m esptool --chip esp32c6 merge-bin -o ../release/ramses_esp_esp32_c6.bin $(tr '\n' ' ' < flash_args)
+        )
+        (sha256sum release/ramses_esp_esp32_c6.bin || shasum -a 256 release/ramses_esp_esp32_c6.bin) > release/ramses_esp_esp32_c6.bin.sha256 || true
+        ls -lh release/ramses_esp_esp32_c6.bin
