@@ -23,6 +23,7 @@ static const char* TAG = "WIFI";
 #include "wifi_cmd.h"
 
 #define WIFI_RECOVERY_BACKOFF_MS 10000
+#define WIFI_RECOVERY_HARD_RESET_CYCLES 3
 
 /* Map configuration to internal constants */
 #if CONFIG_WPA3_SAE_PWE_HUNT_AND_PECK
@@ -103,6 +104,7 @@ struct wifi_data {
     wifi_config_t station_config;
     bool restart;
     TickType_t retry_after_tick;
+    uint8_t failed_cycles;
 };
 
 static struct wifi_data* wifi_ctxt(void)
@@ -255,6 +257,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t e
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
         ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
         ctxt->retry_num = 0;
+        ctxt->failed_cycles = 0;
         xEventGroupClearBits(ctxt->event_group, WIFI_FAIL_BIT);
         xEventGroupSetBits(ctxt->event_group, WIFI_CONNECTED_BIT);
     }
@@ -302,6 +305,28 @@ static void wifi_start(struct wifi_data* ctxt)
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
+static void wifi_enter_failed(struct wifi_data* ctxt, const char* reason)
+{
+    ctxt->failed_cycles++;
+
+    if (ctxt->failed_cycles >= WIFI_RECOVERY_HARD_RESET_CYCLES) {
+        ESP_LOGW(TAG, "WiFi recovery escalation (%s): hard restart after %u failed cycles",
+            reason ? reason : "unknown", ctxt->failed_cycles);
+        esp_wifi_stop();
+        ctxt->retry_num = 0;
+        ctxt->failed_cycles = 0;
+        ctxt->retry_after_tick = 0;
+        ctxt->state = WIFI_CREATED;
+        return;
+    }
+
+    ESP_LOGW(TAG, "WiFi recovery cycle %u/%u (%s), retrying in %d ms",
+        ctxt->failed_cycles, WIFI_RECOVERY_HARD_RESET_CYCLES,
+        reason ? reason : "unknown", WIFI_RECOVERY_BACKOFF_MS);
+    ctxt->state = WIFI_FAILED;
+    ctxt->retry_after_tick = xTaskGetTickCount() + pdMS_TO_TICKS(WIFI_RECOVERY_BACKOFF_MS);
+}
+
 static void wifi_state_machine(struct wifi_data* ctxt)
 {
     EventBits_t bits = 0;
@@ -332,9 +357,8 @@ static void wifi_state_machine(struct wifi_data* ctxt)
         } else if (bits & WIFI_FAIL_BIT) {
             ESP_LOGI(TAG, "Failed to connect to SSID:%s", (char*)ctxt->station_config.sta.ssid);
             printf("# Failed to connect to SSID:%s\n", (char*)ctxt->station_config.sta.ssid);
-            ctxt->state = WIFI_FAILED;
-            ctxt->retry_after_tick = xTaskGetTickCount() + pdMS_TO_TICKS(WIFI_RECOVERY_BACKOFF_MS);
             xEventGroupClearBits(ctxt->event_group, WIFI_FAIL_BIT);
+            wifi_enter_failed(ctxt, "connect-timeout");
         }
         break;
 
@@ -342,6 +366,7 @@ static void wifi_state_machine(struct wifi_data* ctxt)
         if (ctxt->restart) {
             esp_wifi_stop();
             ctxt->restart = false;
+            ctxt->failed_cycles = 0;
             ctxt->retry_after_tick = 0;
             ctxt->state = WIFI_CREATED;
         } else if ((int32_t)(xTaskGetTickCount() - ctxt->retry_after_tick) >= 0) {
@@ -356,13 +381,13 @@ static void wifi_state_machine(struct wifi_data* ctxt)
         if (ctxt->restart) {
             esp_wifi_stop();
             ctxt->restart = false;
+            ctxt->failed_cycles = 0;
             ctxt->retry_after_tick = 0;
             ctxt->state = WIFI_CREATED;
         } else if (bits & WIFI_FAIL_BIT) {
             ESP_LOGW(TAG, "WiFi lost, entering recovery loop");
-            ctxt->state = WIFI_FAILED;
-            ctxt->retry_after_tick = xTaskGetTickCount() + pdMS_TO_TICKS(WIFI_RECOVERY_BACKOFF_MS);
             xEventGroupClearBits(ctxt->event_group, WIFI_FAIL_BIT);
+            wifi_enter_failed(ctxt, "disconnect");
         }
         break;
 
