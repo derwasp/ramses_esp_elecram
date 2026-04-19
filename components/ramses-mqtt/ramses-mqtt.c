@@ -26,6 +26,12 @@ static const char* TAG = "MQTT";
 #include "ramses-mqtt.h"
 #include "ramses_wifi.h"
 
+#define MQTT_WAIT_TICK_MS 50
+#define MQTT_RECONNECT_BACKOFF_MS 5000
+#define MQTT_HEALTH_INTERVAL_MS 30000
+#define MQTT_HEALTH_TIMEOUT_MS 20000
+#define MQTT_HEALTH_WIFI_ESCALATION_COUNT 2
+
 /****************************************************
  * States
  */
@@ -36,7 +42,8 @@ static const char* TAG = "MQTT";
     MQTT_STATE(MQTT_STARTING, "Starting")   \
     MQTT_STATE(MQTT_CONNECTED, "Connected") \
     MQTT_STATE(MQTT_ACTIVE, "Active")       \
-    MQTT_STATE(MQTT_DISCONNECTED, "Disconnected")
+    MQTT_STATE(MQTT_DISCONNECTED, "Disconnected") \
+    MQTT_STATE(MQTT_RESET, "Reset")
 
 #define MQTT_STATE(_e, _t) _e,
 enum mqtt_state {
@@ -73,6 +80,10 @@ struct mqtt_data {
 
     uint8_t info;
     int wait_ticks;  /* reconnect backoff counter */
+    TickType_t next_health_tick;
+    TickType_t health_deadline_tick;
+    int health_msg_id;
+    uint8_t health_failures;
 };
 
 static struct mqtt_data* mqtt_ctxt(void)
@@ -92,6 +103,7 @@ static struct mqtt_data* mqtt_ctxt(void)
             },
         },
         .info = 0,
+        .health_msg_id = -1,
     };
     static struct mqtt_data* ctxt
         = NULL;
@@ -154,6 +166,57 @@ static void mqtt_set_state(struct mqtt_data* ctxt, enum mqtt_state newState)
             ctxt->state = newState;
         }
     }
+}
+
+static void mqtt_reset_health_watchdog(struct mqtt_data* ctxt)
+{
+    TickType_t now = xTaskGetTickCount();
+
+    ctxt->health_msg_id = -1;
+    ctxt->health_deadline_tick = 0;
+    ctxt->next_health_tick = now + pdMS_TO_TICKS(MQTT_HEALTH_INTERVAL_MS);
+}
+
+static int mqtt_publish_health(struct mqtt_data* ctxt)
+{
+    char topic[64];
+    TickType_t now = xTaskGetTickCount();
+
+    snprintf(topic, sizeof(topic), "%s/health", ctxt->topic);
+
+    /* QoS 1 gives us a publish ack we can use as a cheap transport liveness probe. */
+    int msg_id = esp_mqtt_client_publish(ctxt->client, topic, "ping", 4, 1, 0);
+    if (msg_id >= 0) {
+        ctxt->health_msg_id = msg_id;
+        ctxt->health_deadline_tick = now + pdMS_TO_TICKS(MQTT_HEALTH_TIMEOUT_MS);
+        ctxt->next_health_tick = now + pdMS_TO_TICKS(MQTT_HEALTH_INTERVAL_MS);
+    }
+
+    return msg_id;
+}
+
+static void mqtt_reset_client(struct mqtt_data* ctxt, const char* reason)
+{
+    if (reason)
+        ESP_LOGW(TAG, "Resetting MQTT client: %s", reason);
+
+    if (ctxt->client) {
+        esp_err_t err = esp_mqtt_client_stop(ctxt->client);
+        if (err != ESP_OK && err != ESP_FAIL) {
+            ESP_LOGW(TAG, "esp_mqtt_client_stop: %s", esp_err_to_name(err));
+        }
+
+        err = esp_mqtt_client_destroy(ctxt->client);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "esp_mqtt_client_destroy: %s", esp_err_to_name(err));
+        }
+        ctxt->client = NULL;
+    }
+
+    ctxt->info = 0;
+    mqtt_reset_health_watchdog(ctxt);
+    ctxt->wait_ticks = MQTT_RECONNECT_BACKOFF_MS / MQTT_WAIT_TICK_MS;
+    mqtt_set_state(ctxt, MQTT_WAIT);
 }
 
 /****************************************************
@@ -370,6 +433,7 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         ESP_LOGI(TAG, "MQTT_EVENT_CONNECTED");
+        ctxt->health_failures = 0;
         mqtt_set_state(ctxt, MQTT_CONNECTED);
         break;
 
@@ -389,6 +453,10 @@ static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_
 
     case MQTT_EVENT_PUBLISHED:
         ESP_LOGI(TAG, "MQTT_EVENT_PUBLISHED, msg_id=%d %s", event->msg_id, esp_log_system_timestamp());
+        if (event->msg_id == ctxt->health_msg_id) {
+            ctxt->health_msg_id = -1;
+            ctxt->health_deadline_tick = 0;
+        }
         break;
 
     case MQTT_EVENT_DATA:
@@ -472,23 +540,52 @@ static void mqtt_state_machine(struct mqtt_data* ctxt)
         mqtt_subscribe_tx(ctxt);
         mqtt_publish_cmd(ctxt); // Clear old CMD
         mqtt_subscribe_cmd(ctxt);
+        mqtt_reset_health_watchdog(ctxt);
         mqtt_set_state(ctxt, MQTT_ACTIVE);
         break;
 
-    case MQTT_ACTIVE:
+    case MQTT_ACTIVE: {
         if (ctxt->info < INFO_MAX)
             mqtt_publish_info(ctxt);
+
+        TickType_t now = xTaskGetTickCount();
+        if (ctxt->health_msg_id >= 0) {
+            if ((int32_t)(now - ctxt->health_deadline_tick) >= 0) {
+                ctxt->health_failures++;
+                ESP_LOGW(TAG, "MQTT health probe %d timed out (%u/%u)",
+                    ctxt->health_msg_id, ctxt->health_failures, MQTT_HEALTH_WIFI_ESCALATION_COUNT);
+                if (ctxt->health_failures >= MQTT_HEALTH_WIFI_ESCALATION_COUNT && wifi_is_connected()) {
+                    ESP_LOGW(TAG, "Escalating stalled MQTT transport to WiFi restart");
+                    wifi_restart();
+                    ctxt->health_failures = 0;
+                }
+                mqtt_set_state(ctxt, MQTT_RESET);
+            }
+        } else if ((int32_t)(now - ctxt->next_health_tick) >= 0) {
+            int msg_id = mqtt_publish_health(ctxt);
+            if (msg_id < 0) {
+                ctxt->health_failures++;
+                ESP_LOGW(TAG, "MQTT health probe enqueue failed (%u/%u)",
+                    ctxt->health_failures, MQTT_HEALTH_WIFI_ESCALATION_COUNT);
+                if (ctxt->health_failures >= MQTT_HEALTH_WIFI_ESCALATION_COUNT && wifi_is_connected()) {
+                    ESP_LOGW(TAG, "Escalating repeated MQTT enqueue failures to WiFi restart");
+                    wifi_restart();
+                    ctxt->health_failures = 0;
+                }
+                mqtt_set_state(ctxt, MQTT_RESET);
+            }
+        }
         break;
+    }
 
     case MQTT_DISCONNECTED:
-        /* Do NOT call stop()+destroy() here. The esp_mqtt_task is still running
-         * when this state is entered (the disconnect event was dispatched from
-         * within that task). Destroying the handle while the task runs causes
-         * a use-after-free crash (MEPC=0x00010008 / Instruction access fault).
-         * Instead we keep the client alive and use esp_mqtt_client_reconnect()
-         * in MQTT_START, which is safe to call from any context. */
-        ctxt->wait_ticks = 5000 / 50;
-        mqtt_set_state(ctxt, MQTT_WAIT);
+        /* The disconnect callback runs in the MQTT task context, so defer the
+         * stop()+destroy() work to this outer state machine task. */
+        mqtt_set_state(ctxt, MQTT_RESET);
+        break;
+
+    case MQTT_RESET:
+        mqtt_reset_client(ctxt, "transport recovery");
         break;
 
     default:
